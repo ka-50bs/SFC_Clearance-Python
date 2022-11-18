@@ -6,6 +6,7 @@ import sklearn
 from sklearn.cluster import KMeans
 from sklearn.cluster import DBSCAN
 from sklearn.cluster import MeanShift, estimate_bandwidth
+from sklearn.preprocessing import MinMaxScaler
 
 from scipy import optimize
 import matplotlib.pyplot as plt
@@ -30,36 +31,48 @@ class SFC_MieFitting(object):
         - μ - массив, фазовый диапазон вычисления теории Ми, у.е.
 
         - bounds - кортеж, диапазоны параметров для решения обратной задачи
-            * bounds[0] - радиус частицы, нм
-            * bounds[1] - показатель преломления частицы, у.е.
-            * bounds[2] - скорость частицы (потока обжимающей жидкости), м/с
-            * bounds[3] - расстояние до триггера, м
-            * bounds[4] - коэффициент Ми/мВ
+            * bounds[0] - d, размер частицы, нм
+            * bounds[1] - n, показатель преломления частицы, у.е.
+            * bounds[2] - v, скорость частицы (потока обжимающей жидкости), м/с
+            * bounds[3] - l0, расстояние до триггера, м
+            * bounds[4] - I, коэффициент мВ/Ми
         '''
 
-        self.n0 = 1.333
+        self.n0 = 1.333333333
         self.n1 = 1.458
-        self.λ = 660 / self.n0
+        self.λ = 660
         self.R = 2.5 * 10 ** -3
         self.h = 8 * 10 ** -3
         self.H = 180 * 10 ** -3
         self.d = 0.254 * 10 ** -3
         self.Δ = 1.1 * 10 ** -3
         self.fADC = 750000
-        self.angles = np.linspace(4, 110, 180)
-        self.tf = self.transfer_function(self.angles)
+        self.angles = np.linspace(10, 110, 180)
 
-        self.hf = self.hardware_function_m(self.angles) * self.hardware_function(self.angles)
-        #self.hf = self.hardware_function_m(self.angles) * self.tf_hf(self.angles)[1]
-
-        self.hf = self.hf / np.amax(self.hf)
 
         self.μ = np.cos(self.angles / 180 * np.pi)
 
-        self.bounds = ((2.3, 2.6), (-0.0045, -0.0035), (10 ** 4, 10 ** 6))
+        self.bounds_vxa = ((2.3, 2.6),
+                           (-0.0045, -0.0035),
+                           (10 ** 5, 3 * 10 ** 5))
+
+        self.bounds_dnvxa = ((3600, 3800),
+                             (1.57, 1.59),
+                             (2.3, 2.6),
+                             (-0.0045, -0.0035),
+                             (10 ** 5, 3 * 10 ** 5))
+
+        self.bounds_dnv = ((3400, 4000),
+                           (1.50, 1.60),
+                           (2.3, 2.6))
 
         self.Iexp = None
         self.Texp = None
+
+    def tf_hf_init(self):
+        self.tf = self.transfer_function(self.angles)
+        self.hf = self.hardware_function_m(self.angles)
+        self.hf = self.hf / np.amax(self.hf)
 
     def tf_hf(self, θ):
         '''
@@ -150,7 +163,7 @@ class SFC_MieFitting(object):
         '''
         Функция вычисляющая М-функцию
         :param θ: массив, состоящий из углов рассеяния
-        :return: возвращает зависимость δθ(θ)
+        :return: возвращает зависимость MF(θ)
         '''
         m = np.exp(-2 * (np.log(θ / 54)) ** 2) / θ
         return m
@@ -164,7 +177,7 @@ class SFC_MieFitting(object):
         :param n: безразмерный параметр, показатель преломления частицы
         :return: индикатриса светорассеяния, вычисленная по заданным углам I(θ)
         '''
-        I = np.array(miepython.ez_intensities(n / self.n0, r, self.λ, self.μ)[0])
+        I = np.array(miepython.ez_intensities(n, r, self.λ, self.μ, n_env = self.n0)[0])
         return I
 
     def trace_zero_norm(self, Ind_exp):
@@ -176,6 +189,7 @@ class SFC_MieFitting(object):
         :param Ind_exp: Массив, трейс светорассеяния I(t)
         :return: Массив, обработанный трейс светорассеяния I'(t)
         '''
+
         Ind_edited = np.copy(Ind_exp)
         for i in range(len(Ind_edited)):
             Ind_edited[i] = Ind_exp[i] - np.mean(np.sort(Ind_exp[i])[:1000]) - 3 * np.std(np.sort(Ind_exp[i])[:1000])
@@ -193,7 +207,14 @@ class SFC_MieFitting(object):
         '''
         bounds = [[0, np.amin(x_func), 0],
                   [np.amax(y_func), np.amax(x_func), np.mean(x_func)]]
-        popt, pcov = curve_fit(f=func, xdata=x_func, ydata=y_func, bounds=bounds)
+        try:
+            popt, pcov = curve_fit(f=func, xdata=x_func, ydata=y_func, bounds=bounds)
+        except:
+            print('Bad Signal!')
+            popt = np.zeros(3)
+        # plt.plot(y_func, '*')
+        # plt.plot(func(x_func, popt[0],popt[1],popt[2]))
+        # plt.show()
         return popt
 
     def time_cutter(self, Ind_exp, Trig_exp):
@@ -209,10 +230,18 @@ class SFC_MieFitting(object):
         :return: Массив, обработанный трейс светорассеяния I'(t)
         '''
 
+        def func(x_, a, x0, sigma):
+            return a * np.exp(-(x_ - x0) ** 2 / (2 * sigma ** 2))
+
         Ind_exp = np.copy(Ind_exp)[:, :2000]
         Trig_exp = np.copy(Trig_exp)[:, :400]
 
         time = np.array(range(len(Ind_exp[0])))
+        time_trig = np.array(range(len(Trig_exp[0])))
+
+        bounds = [[0, np.amin(time_trig), 0],
+                  [np.amax(Trig_exp), np.amax(time_trig), np.mean(time_trig)]]
+
         ind_pars = []
         time_array = []
 
@@ -224,28 +253,30 @@ class SFC_MieFitting(object):
         width = np.mean(ind_pars[:, 2])
 
         for i in tqdm(range(len(Ind_exp)),  desc ='Time Normalizing Processing'):
-            itime = (time[int(center - 2 * width): int(center + 2 * width)])
+            itime = (time[int(center - 1 * width): int(center + 1 * width)])
             itime = itime - np.argmax(Trig_exp[i])
             itime = itime / self.fADC
             time_array.append(itime)
 
         time_array = np.array(time_array)
 
-        return Ind_exp[:, int(center - 2 * width): int(center + 2 * width)], time_array
+        return Ind_exp[:, int(center - 1 * width): int(center + 1 * width)], time_array
 
 
-    def cluster_filter(self, x, y):
+    def cluster_int_filter(self, x, y):
         '''
         Функция фильтрации трейсов по производной характеристике сигнала - полному интегралу трейса Sum(I(t)).
-        Выборка Sum(I(t)) кластеризуется методом MeanShift, а далее выбирается средний кластер. Это делается в
-        в предположении, что сигналы светорассеяния условно делятся на три кластера:
-        - Кластер частиц с низким сигналом светорассения (условно мусорный сигнал)
-        - Кластер частиц со средним сигналом светорассения (нужный сигнал)
-        - Кластер частиц со высоким сигналом светорассения (сигналы с зашкалом)
+        Выборка Sum(I(t)) кластеризуется методом MeanShift. На данном этапе производится обычная разметка
+        данных без предварительного выбора нужного кластера частиц. Для того, чтобы выбрать нужный кластер,
+        нужно вне функции выбрать требуемый тип частиц (кластер). Возможно, через несколько иттераций будет добавлено
+        выбор кластера по стороннему критерию.
+        :param x: Входной массив предобработанных трейсов, по которыс производится классификация
+        :param y: Входной массив временных точек трейсов. Не используется в функции, но может понадобится при выборе
+        нужного кластера частиц, если ,будет сделана модификация функции
 
-        :param x:
-        :param y:
-        :return:
+        :return: x_edited: выходной массив трейсов
+        :return: y_edited: выходной масиив временных точек трейсов
+        :return: labels: выходной масиив
         '''
 
         x_edited = np.copy(x)
@@ -256,19 +287,55 @@ class SFC_MieFitting(object):
             sum_list.append(sum(x_edited[i]))
 
         sum_list = np.reshape(sum_list, (-1, 1))
-        bandwidth = estimate_bandwidth(sum_list, quantile=0.1)
+        bandwidth = estimate_bandwidth(sum_list, quantile=0.3)
         ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
         ms.fit(sum_list)
         cluster_center = ms.cluster_centers_
         labels = ms.labels_
 
-        return x_edited[labels == 1], y_edited[labels == 1]
+        return x_edited, y_edited, labels
+
+    def cluster_cm_filter(self, x, y):
+        '''
+
+        :return: x_edited: выходной массив трейсов
+        :return: y_edited: выходной масиив временных точек трейсов
+        :return: labels: выходной масиив
+        '''
+
+        x_edited = np.copy(x)
+        y_edited = np.copy(y)
+
+        cm_list = []
+        for i in range(len(x_edited)):
+            y_cm = np.sum(x_edited[i] * y_edited[i]) / np.sum(x_edited[i])
+            x_cm = np.sum(x_edited[i] * y_edited[i]) / np.sum(y_edited[i])
+            cm_list.append((y_cm, x_cm))
+
+        cm_list = np.array(cm_list)
+
+        scaler = MinMaxScaler()
+        cm_list = scaler.fit_transform(cm_list)
+
+        bandwidth = estimate_bandwidth(cm_list, quantile=0.3)
+        ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+        ms.fit(cm_list)
+        cluster_center = ms.cluster_centers_
+        labels = ms.labels_
+
+        for i in range(len(np.unique(labels))):
+            data = cm_list[labels == i]
+            plt.plot(data[:,0],data[:,1], '*', label='label%d' %(i))
+
+        plt.legend()
+        plt.show()
+
+        return x_edited, y_edited, labels
 
     def trace_th(self, args):
         '''
         Функция, вычисляющая теоритический трейс светорассеяния
-        :param args:
-        :param Iexp:
+        :param args: [r, _n, _v, _x0, _α]
         :return:
         '''
 
@@ -280,40 +347,162 @@ class SFC_MieFitting(object):
         return mie_inter * _α
 
     def metric(self, Iexp, Ith):
+        '''
+        Функция метрики различия двух сигналов,
+        :param Iexp: Массив экспериментального сигнала
+        :param Ith: Массив теоретического сигнала
+        :return: Значение нужной метрики (L2)
+        '''
         def l2_metric(Iexp, Ith):
-            return np.sum((Iexp - Ith) ** 2) / np.sum(Iexp)
-
-        def c_mass_metric(Iexp, Ith):
-            def c_mass(x):
-                return np.sum(x * self.Texp) / np.sum(x)
-
-            return np.abs(c_mass(Iexp) - c_mass(Ith)) / c_mass(Iexp)
-
-        def fft_metric(Iexp, Ith):
-            return np.sum((np.fft.hfft(Iexp) - np.fft.hfft(Ith) ** 2)) / np.sum((np.fft.hfft(Iexp)) ** 2)
-
+            return np.sum((Iexp - Ith) ** 2)# / np.sum(Iexp ** 2)
         return l2_metric(Iexp, Ith)
 
-    def fit(self, Texp, Iexp):
+
+    def bayesian_errors(self, mse_map, mse_pars, I_exp):
+        '''
+        Функция вычисления ошибок методом Байесса.
+
+        :param mse_map:
+        :param mse_pars:
+        :param I_exp:
+        :return:
+        '''
+
+        N = len(I_exp)
+
+        auto_corr = np.zeros(N)
+        for tau in range(N):
+            for t in range(N):
+                if t - tau > 0:
+                    auto_corr[tau] = auto_corr[tau] + I_exp[t] * I_exp[t - tau]
+
+        n = N ** 2 / (N + 2 * sum(N - k for k in range(1, N - 1)) * auto_corr)
+        S = lambda x: x ** (-n / 2)
+        k = (np.sum(S(mse_map))) ** -1
+        mean = k * np.sum(mse_pars * S, axis = 0)
+        sigma = k * np.sum((mean - mse_pars) * S, axis = 0)
+        return mean, sigma
+
+    def fit_serial(self, Texp_array, Iexp_array):
+        '''
+        Функция, решающая обратную задачу светорассеяния для сферической однороднной латексной частицы описанной пятью
+        параметрами методом псоследовательного фиттинга.
+        :param Texp_array:
+        :param Iexp_array:
+        :return:
+        '''
+
+        def fit_vli(Texp, Iexp):
+            '''
+            Функция, решающая обратную задачу трех параметров для латексной частицы:
+            * v, скорость частицы (потока обжимающей жидкости), м/с
+            * l0, расстояние до триггера, м
+            * I0, коэффициент мВ/Ми
+            Решение производится в предположении о том, что известны параметры размера и показателя преломления
+            исследуемой сферической однородной частицы, а именно d = 3700nm, n = 1.584
+            :param Texp:
+            :param Iexp:
+            :return:
+            '''
+
+            self.Iexp = Iexp
+            self.Texp = Texp
+
+            def mininisation_func_vli(args):
+                params = [3700, 1.584, args[0], args[1], args[2]]
+                Ith = self.trace_th(params)
+                return self.metric(Iexp, Ith)
+
+            res = optimize.direct(func=mininisation_func_vli,
+                                  bounds=self.bounds_vxa,
+                                  maxfun=5000,
+                                  maxiter=5000,
+                                  locally_biased=False,
+                                  eps=1)
+            solve = list([3700, 1.584, res.x[0], res.x[1], res.x[2]])
+            #trace_th = self.trace_th(solve)
+            return solve
+
+        def fit_dnv(Texp, Iexp, l0, I0):
+            '''
+            Функция, решающая обратную задачу трех параметров для латексной частицы:
+            * d, размер частицы, нм
+            * n, показатель преломления частицы, у.е.
+            * v, скорость частицы (потока обжимающей жидкости), м/с
+            Решение производится в предположении о том, что известны параметры расстояния до триггера и коффициента мв/Ми
+            исследуемой сферической однородной частицы, а именно d = 3700nm, n = 1.584
+            :param Texp:
+            :param Iexp:
+            :param l0:
+            :param I0:
+            :return:
+            '''
+
+            self.Iexp = Iexp
+            self.Texp = Texp
+
+            def mininisation_func_dnv(args):
+                params = [args[0], args[1], args[2], l0, I0]
+                Ith = self.trace_th(params)
+                return self.metric(Iexp, Ith)
+
+            res = optimize.direct(func=mininisation_func_dnv,
+                                  bounds=self.bounds_dnv,
+                                  maxfun=5000,
+                                  maxiter=5000,
+                                  locally_biased=False,
+                                  eps=1)
+            solve = list([res.x[0], res.x[1], res.x[2], l0, I0])
+            #trace_th = self.trace_th(solve)
+            return solve
+
+
+
+        N_array = len(Texp_array)
+
+        pre_solve = []
+        solve = []
+
+        for i in tqdm(range(N_array), desc ="Pre_Solvation"):
+            pre_solve.append(fit_vli(Texp_array[i], Iexp_array[i]))
+
+        pre_solve = np.array(pre_solve)
+
+        (global_lo, global_Io) = (np.mean(pre_solve[:, 3]), np.mean(pre_solve[:, 4]))
+
+        for i in tqdm(range(N_array), desc ="Solvation"):
+            solve.append(fit_dnv(Texp_array[i], Iexp_array[i], global_lo, global_Io))
+
+        solve = np.array(solve)
+        return solve
+
+    def fit_global(self, Texp, Iexp):
+        '''
+        Функция, решающая обратную задачу светорассеяния для сферической однороднной латексной частицы описанной пятью
+        параметрами методом глобального фиттинга.
+        :param Texp:
+        :param Iexp:
+        :return:
+        '''
+
         self.Iexp = Iexp
         self.Texp = Texp
 
-        def mininisation_func(args):
-            ss = [3700, 1.584, args[0], args[1], args[2]]
-            trace_th = self.trace_th(ss)
-            return self.metric(self.Iexp, trace_th)
+        def mininisation_func_rnvxa(args):
+            params = [args[0], args[1], args[2], args[3], args[4]]
+            Ith = self.trace_th(params)
+            return self.metric(Iexp, Ith)
 
-        res = optimize.direct(func=mininisation_func,
-                              bounds=self.bounds,
-                              maxfun=10000,
-                              maxiter=10000,
+        res = optimize.direct(func=mininisation_func_rnvxa,
+                              bounds=self.bounds_dnvxa,
+                              maxfun=5000,
+                              maxiter=5000,
                               locally_biased=False,
                               eps=1)
+        solve = list([res.x[0], res.x[1], res.x[2], res.x[3], res.x[4]])
+        #trace_th = self.trace_th(solve)
+        return solve
 
-        trace_th = self.trace_th([3700, 1.584, res.x[0], res.x[1], res.x[2]])
-
-        solve = list(res.x)
-        return solve, trace_th
     pass
 
 
